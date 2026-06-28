@@ -46,15 +46,15 @@ void setupSD() {
 // =========================
 const i2s_port_t MIC_I2S_PORT = I2S_NUM_1;  // separate I2S mic path from playback path
 #define MIC_SAMPLE_RATE   16000
-#define MIC_PIN_SCK       TX
-#define MIC_PIN_WS        RX  // LRCK
-#define MIC_PIN_SD        9
+#define MIC_PIN_SCK       2
+#define MIC_PIN_WS        TX  // LRCK
+#define MIC_PIN_SD        RX
 
 i2s_chan_handle_t micRxChan = NULL;
 
-#define OUTPUT_BCLK 6
-#define OUTPUT_LRCK 7
-#define OUTPUT_DOUT 8
+#define OUTPUT_BCLK 13  // TO CHANGE: AREF
+#define OUTPUT_LRCK 11  // TO CHANGE: SCL for WSEL
+#define OUTPUT_DOUT 12  // TO CHANGE: SDA
 
 #define SAMPLE_RATE 44100
 #define TONE_FREQ   440.0
@@ -71,17 +71,50 @@ Audio audio;
 #define BUFFER_SIZE 1024  // Buffer size
 #define VOLUME_SCALE 4.0f  // Mic gain after high-pass filter. Increase for audible debug WAV; clamp prevents overflow.
 #define MIC_SAMPLE_SHIFT 14  // SPH0645 useful bits are in the high part of the 32-bit word.
-#define MIC_STARTUP_SKIP_MS 250  // Suppress mic startup transient, while still preserving timing with zeros.
+#define MIC_STARTUP_SKIP_MS 500  // Suppress mic startup transient, while still preserving timing with zeros.
 #define DURATION_SEC 10
 
 // =========================
 // --- Button setup ---
 // =========================
-const int PLAY_BUTTON_PIN = 12;
-const int RECORD_BUTTON_PIN = 13;
+#define PLAY_BUTTON_PIN 15  // A1
+#define RECORD_BUTTON_PIN 1  // A5
+
+// Hold PLAY/PAUSE to skip.
+// Short press toggles play/pause on release.
+// Long press skips the current track after this many milliseconds.
+static const uint32_t PLAY_HOLD_SKIP_MS = 2500;
+
+// Double-tap controls:
+// - Double-tap PLAY decreases volume
+// - Double-tap RECORD increases volume
+// Single-tap actions are delayed briefly so the second tap can be detected.
+static const uint32_t DOUBLE_TAP_WINDOW_MS = 350;
+static const uint32_t BUTTON_DEBOUNCE_MS = 40;
+
+// ESP32-audioI2S volume is normally 0..21.
+static const uint8_t AUDIO_VOLUME_MIN = 0;
+static const uint8_t AUDIO_VOLUME_MAX = 21;
+static const uint8_t AUDIO_VOLUME_STEP = 1;
+uint8_t currentVolume = 9;
+
+// Optional: wire a small piezo buzzer/speaker to this GPIO for min/max beeps.
+// Leave as -1 if you do not have a separate buzzer yet.
+#define LIMIT_BEEP_PIN -1
+
 bool isPaused = false;
 bool lastPlayButtonState = HIGH;
 bool lastRecordButtonState = HIGH;
+uint32_t playButtonPressedAt = 0;
+bool playButtonSkipHandled = false;
+uint32_t recordButtonPressedAt = 0;
+
+bool pendingPlaySingleTap = false;
+uint32_t pendingPlaySingleTapAt = 0;
+bool pendingRecordSingleTap = false;
+uint32_t pendingRecordSingleTapAt = 0;
+
+volatile bool suppressNextEofAdvance = false;
 
 // Global buffers for recording
 int32_t buffer32[BUFFER_SIZE];  // Buffer for 32-bit data from the microphone
@@ -143,6 +176,7 @@ static const float OVERLAY_NOISE_FLOOR_RMS = 200.0f;
 
 int16_t* overlaySamples = NULL;
 volatile bool overlayRecording = false;
+volatile bool overlayStopRequested = false;
 volatile bool overlayReady = false;
 volatile uint32_t overlaySampleCount = 0;
 int overlayTargetIndex = -1;
@@ -154,6 +188,7 @@ uint32_t overlayStartMillisIntoTrack = 0;
 
 void overlayRecordTask(void* param);
 bool beginOverlayCaptureForCurrentTrack(int index);
+void stopOverlayCapture();
 void servicePendingOverlayMix();
 bool renderOverlayMixToFile(const char* basePath, const char* outputPath, const int16_t* overlay, uint32_t overlayCount);
 
@@ -169,6 +204,13 @@ bool writeDebugMicWav(const char* path, const int16_t* samples, uint32_t sampleC
 volatile bool debugForceEndTrackAfterOverlay = false;
 
 void scheduleOverlayMixForTrackEnd();
+void skipToNextTrack();
+void togglePlayPause();
+void handleRecordSingleTap();
+void servicePendingButtonSingleTaps();
+void increaseVolume();
+void decreaseVolume();
+void playLimitBeep();
 
 struct WavInfo {
   uint32_t sampleRate;
@@ -194,6 +236,15 @@ void my_audio_info(Audio::msg_t m) {
     case Audio::evt_info:           Serial.printf("info: ....... %s\n", m.msg); break;
     case Audio::evt_eof: {
       Serial.printf("end of file:  %s\n", m.msg); 
+
+      // If we manually stopped the song to skip, Audio.h may still emit evt_eof.
+      // In that case, skipToNextTrack() already advanced currentTrack, so avoid double-advancing.
+      if (suppressNextEofAdvance) {
+        suppressNextEofAdvance = false;
+        trackStarted = false;
+        break;
+      }
+
       // TODO FEATURE 3: mix only after playback finishes so we never write into a file while Audio.h is reading it.
       scheduleOverlayMixForTrackEnd();
       trackStarted = false;
@@ -498,6 +549,118 @@ void startTrack(int index) {
   // TODO FEATURE 3:
   // Overlay capture is now button-controlled by RECORD_BUTTON_PIN in loop(),
   // rather than starting automatically at the beginning of every track.
+}
+
+void skipToNextTrack() {
+  if (currentTrack < 0 || currentTrack >= queueLen) {
+    return;
+  }
+
+  Serial.printf("skip: %s\n", queue[currentTrack].path);
+
+  // Treat a manual skip like ending the current track for overlay bookkeeping.
+  // If no overlay was captured, this does nothing.
+  scheduleOverlayMixForTrackEnd();
+
+  // Stop the current song. Some Audio.h builds may emit evt_eof from stopSong(),
+  // so suppress one EOF advance because we advance currentTrack below.
+  suppressNextEofAdvance = true;
+  audio.stopSong();
+
+  trackStarted = false;
+  isPaused = false;
+  currentTrack++;
+
+  if (currentTrack >= queueLen) {
+    playbackDone = true;
+    Serial.println("skip: reached end of queue");
+  }
+}
+
+void playLimitBeep() {
+#if LIMIT_BEEP_PIN >= 0
+  // Separate buzzer/piezo feedback so it does not interrupt SD playback.
+  tone(LIMIT_BEEP_PIN, 1200, 80);
+#endif
+  Serial.println("volume limit beep");
+}
+
+void increaseVolume() {
+  if (currentVolume >= AUDIO_VOLUME_MAX) {
+    currentVolume = AUDIO_VOLUME_MAX;
+    audio.setVolume(currentVolume);
+    Serial.println("volume already at max");
+    playLimitBeep();
+    return;
+  }
+
+  currentVolume = min((uint8_t)AUDIO_VOLUME_MAX, (uint8_t)(currentVolume + AUDIO_VOLUME_STEP));
+  audio.setVolume(currentVolume);
+  Serial.printf("volume up: %u\n", currentVolume);
+}
+
+void decreaseVolume() {
+  if (currentVolume <= AUDIO_VOLUME_MIN) {
+    currentVolume = AUDIO_VOLUME_MIN;
+    audio.setVolume(currentVolume);
+    Serial.println("volume already at min");
+    playLimitBeep();
+    return;
+  }
+
+  currentVolume = (currentVolume > AUDIO_VOLUME_STEP) ? currentVolume - AUDIO_VOLUME_STEP : AUDIO_VOLUME_MIN;
+  audio.setVolume(currentVolume);
+  Serial.printf("volume down: %u\n", currentVolume);
+}
+
+void togglePlayPause() {
+  isPaused = !isPaused;
+
+  if (isPaused) {
+    Serial.println("pause");
+    audio.pauseResume();
+  } else {
+    Serial.println("play");
+    audio.pauseResume();
+  }
+}
+
+void handleRecordSingleTap() {
+  // RECORD now behaves like PLAY/PAUSE:
+  // - first single tap starts the recording window
+  // - next single tap stops the recording window
+  // Double-tap is still reserved for volume up, so this handler is called only
+  // after DOUBLE_TAP_WINDOW_MS has passed without a second tap.
+  if (overlayRecording) {
+    stopOverlayCapture();
+    return;
+  }
+
+  if (!trackStarted || playbackDone) {
+    Serial.println("record ignored: no active track");
+  } else if (isPaused) {
+    Serial.println("record ignored: playback is paused");
+  } else if (overlayReady || mixPending) {
+    Serial.println("record ignored: overlay already captured for this track");
+  } else {
+    overlayStartMillisIntoTrack = millis() - currentTrackStartMillis;
+    Serial.printf("recording window start at %lu ms into track\n", (unsigned long)overlayStartMillisIntoTrack);
+    beginOverlayCaptureForCurrentTrack(currentTrack);
+  }
+}
+
+void servicePendingButtonSingleTaps() {
+  uint32_t now = millis();
+
+  if (pendingPlaySingleTap && now - pendingPlaySingleTapAt > DOUBLE_TAP_WINDOW_MS) {
+    pendingPlaySingleTap = false;
+    togglePlayPause();
+  }
+
+  if (pendingRecordSingleTap && now - pendingRecordSingleTapAt > DOUBLE_TAP_WINDOW_MS) {
+    pendingRecordSingleTap = false;
+    handleRecordSingleTap();
+  }
 }
 
 // void startTrack(int index) {
@@ -876,6 +1039,7 @@ bool beginOverlayCaptureForCurrentTrack(int index) {
   overlayTargetIndex = index;
   overlaySampleCount = 0;
   overlayReady = false;
+  overlayStopRequested = false;
   overlayRecording = true;
 
   BaseType_t ok = xTaskCreatePinnedToCore(overlayRecordTask, "overlayRecordTask", 8192, NULL, 2, NULL, 1);
@@ -891,6 +1055,16 @@ bool beginOverlayCaptureForCurrentTrack(int index) {
   return true;
 }
 
+void stopOverlayCapture() {
+  if (!overlayRecording) {
+    Serial.println("record stop ignored: not currently recording");
+    return;
+  }
+
+  overlayStopRequested = true;
+  Serial.println("recording window stop requested");
+}
+
 void overlayRecordTask(void* param) {
   Serial.println("TODO FEATURE 3: overlayRecordTask started");
 
@@ -904,7 +1078,7 @@ void overlayRecordTask(void* param) {
   float dcPrev = 0.0f;
   float outPrev = 0.0f;
 
-  while (captured < maxSamples) {
+  while (captured < maxSamples && !overlayStopRequested) {
     size_t bytesRead = 0;
     esp_err_t err = i2s_channel_read(micRxChan, buffer32, BUFFER_SIZE * sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(250));
     if (err != ESP_OK || bytesRead == 0) continue;
@@ -930,8 +1104,9 @@ void overlayRecordTask(void* param) {
   }
 
   overlaySampleCount = captured;
-  overlayReady = true;
+  overlayReady = (captured > 0);
   overlayRecording = false;
+  overlayStopRequested = false;
 
   Serial.printf("TODO FEATURE 3: overlay capture complete (%lu samples from %lu reads)\n",
                 (unsigned long)captured, (unsigned long)readBlocks);
@@ -1215,7 +1390,6 @@ void servicePendingOverlayMix() {
 
 void setup() {
   Serial.begin(115200);
-  while(!Serial) {yield();}
 
   Serial.println("Initializing SPI...");
   Audio::audio_info_callback = my_audio_info;
@@ -1227,6 +1401,9 @@ void setup() {
 
   pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
   pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP);
+#if LIMIT_BEEP_PIN >= 0
+  pinMode(LIMIT_BEEP_PIN, OUTPUT);
+#endif
 
   Serial.println("Locating manifest:");
   MANIFEST_PATH = findPath("playlist-manifest.json", 5, true);
@@ -1273,7 +1450,7 @@ void setup() {
   //   while (true) delay(1000);
   // }
   audio.setPinout(OUTPUT_BCLK, OUTPUT_LRCK, OUTPUT_DOUT);
-  audio.setVolume(9);
+  audio.setVolume(currentVolume);
   audio.setOutput48KHz(SAMPLE_RATE);
   // debugAudioOutput();
   startTrack(currentTrack);
@@ -1283,55 +1460,83 @@ void setup() {
 
 void loop() {
   // =========================
-  // PLAY / PAUSE BUTTON
+  // PLAY / PAUSE / SKIP / VOLUME-DOWN BUTTON
   // =========================
 
   bool currentPlayButtonState = digitalRead(PLAY_BUTTON_PIN);
 
-  // Detect button press (HIGH -> LOW)
+  // Button uses INPUT_PULLUP:
+  // - HIGH means released
+  // - LOW means pressed
+  //
+  // Single tap: toggle play/pause after DOUBLE_TAP_WINDOW_MS.
+  // Double tap: decrease volume.
+  // Long press: skip current track after PLAY_HOLD_SKIP_MS.
   if (lastPlayButtonState == HIGH && currentPlayButtonState == LOW) {
-    isPaused = !isPaused;
+    playButtonPressedAt = millis();
+    playButtonSkipHandled = false;
+  }
 
-    if (isPaused) {
-      Serial.println("pause");
-      audio.pauseResume();
-    } else {
-      Serial.println("play");
-      audio.pauseResume();
+  if (currentPlayButtonState == LOW && !playButtonSkipHandled) {
+    if (millis() - playButtonPressedAt >= PLAY_HOLD_SKIP_MS) {
+      playButtonSkipHandled = true;
+      pendingPlaySingleTap = false;
+      Serial.println("play button hold: skip");
+      skipToNextTrack();
     }
+  }
 
-    delay(200); // simple debounce
+  if (lastPlayButtonState == LOW && currentPlayButtonState == HIGH) {
+    uint32_t now = millis();
+    uint32_t pressDuration = now - playButtonPressedAt;
+
+    if (!playButtonSkipHandled && pressDuration >= BUTTON_DEBOUNCE_MS) {
+      if (pendingPlaySingleTap && now - pendingPlaySingleTapAt <= DOUBLE_TAP_WINDOW_MS) {
+        pendingPlaySingleTap = false;
+        Serial.println("play button double tap: volume down");
+        decreaseVolume();
+      } else {
+        pendingPlaySingleTap = true;
+        pendingPlaySingleTapAt = now;
+      }
+    }
   }
 
   lastPlayButtonState = currentPlayButtonState;
 
 
   // =========================
-  // RECORD BUTTON
+  // RECORD START/STOP / VOLUME-UP BUTTON
   // =========================
 
   bool currentRecordButtonState = digitalRead(RECORD_BUTTON_PIN);
 
-  // Detect button press (HIGH -> LOW)
-  if (lastRecordButtonState == HIGH && currentRecordButtonState == LOW) {
-    if (!trackStarted || playbackDone) {
-      Serial.println("record ignored: no active track");
-    } else if (isPaused) {
-      Serial.println("record ignored: playback is paused");
-    } else if (overlayRecording) {
-      Serial.println("record ignored: already recording");
-    } else if (overlayReady || mixPending) {
-      Serial.println("record ignored: overlay already captured for this track");
-    } else {
-      overlayStartMillisIntoTrack = millis() - currentTrackStartMillis;
-      Serial.printf("recording at %lu ms into track\n", (unsigned long)overlayStartMillisIntoTrack);
-      beginOverlayCaptureForCurrentTrack(currentTrack);
-    }
+  // Single tap: start recording window if not recording, stop recording window if recording.
+  // Double tap: increase volume.
 
-    delay(200); // simple debounce
+  if (lastRecordButtonState == HIGH && currentRecordButtonState == LOW) {
+    recordButtonPressedAt = millis();
+  }
+
+  if (lastRecordButtonState == LOW && currentRecordButtonState == HIGH) {
+    uint32_t now = millis();
+    uint32_t pressDuration = now - recordButtonPressedAt;
+
+    if (pressDuration >= BUTTON_DEBOUNCE_MS) {
+      if (pendingRecordSingleTap && now - pendingRecordSingleTapAt <= DOUBLE_TAP_WINDOW_MS) {
+        pendingRecordSingleTap = false;
+        Serial.println("record button double tap: volume up");
+        increaseVolume();
+      } else {
+        pendingRecordSingleTap = true;
+        pendingRecordSingleTapAt = now;
+      }
+    }
   }
 
   lastRecordButtonState = currentRecordButtonState;
+
+  servicePendingButtonSingleTaps();
 
 
   // =========================
