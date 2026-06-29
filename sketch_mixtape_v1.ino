@@ -71,7 +71,7 @@ Audio audio;
 #define BUFFER_SIZE 1024  // Buffer size
 #define VOLUME_SCALE 4.0f  // Mic gain after high-pass filter. Increase for audible debug WAV; clamp prevents overflow.
 #define MIC_SAMPLE_SHIFT 14  // SPH0645 useful bits are in the high part of the 32-bit word.
-#define MIC_STARTUP_SKIP_MS 500  // Suppress mic startup transient, while still preserving timing with zeros.
+#define MIC_STARTUP_SKIP_MS 250  // Suppress mic startup transient, while still preserving timing with zeros.
 #define DURATION_SEC 10
 
 // =========================
@@ -97,10 +97,6 @@ static const uint8_t AUDIO_VOLUME_MIN = 0;
 static const uint8_t AUDIO_VOLUME_MAX = 21;
 static const uint8_t AUDIO_VOLUME_STEP = 1;
 uint8_t currentVolume = 9;
-
-// Optional: wire a small piezo buzzer/speaker to this GPIO for min/max beeps.
-// Leave as -1 if you do not have a separate buzzer yet.
-#define LIMIT_BEEP_PIN -1
 
 bool isPaused = false;
 bool lastPlayButtonState = HIGH;
@@ -142,6 +138,12 @@ bool trackStarted = false;
 bool playbackDone = false;
 uint32_t currentTrackStartMillis = 0;
 
+// Set this from the Audio.h callback when playback is actually ready, rather
+// than immediately after connecttoFS(), because connecttoFS() can return before
+// decoded audio has reached the DAC/output buffer.
+volatile bool waitingForAudibleStart = false;
+static const int32_t AUDIO_START_OFFSET_MS = 0;  // Tune if testing shows the callback fires slightly early/late.
+
 // =========================
 // TODO FEATURE 3: overlay capture + deferred mix state
 // =========================
@@ -150,7 +152,10 @@ uint32_t currentTrackStartMillis = 0;
 // - when Audio::evt_eof fires, defer mixing until loop() so heavy file I/O does not run inside callback
 // - render a new WAV copy with the mono mic overlay mixed into both L/R channels
 // - update the queue path to point at the rendered copy for later replay
-static const uint32_t OVERLAY_RECORD_SECONDS = 10;
+// Overlay capture no longer uses a fixed time window.
+// beginOverlayCaptureForCurrentTrack() reads the current WAV header and sizes
+// the max capture window from the track duration; overlayRecordTask exits early
+// on the second RECORD tap or when playback reaches EOF.
 
 // --- Knobs for recording normalization ---
 // Desired overlay loudness relative to the base track in percentage
@@ -176,9 +181,12 @@ static const float OVERLAY_NOISE_FLOOR_RMS = 200.0f;
 
 int16_t* overlaySamples = NULL;
 volatile bool overlayRecording = false;
-volatile bool overlayStopRequested = false;
 volatile bool overlayReady = false;
+volatile bool overlayStopRequested = false;
+volatile bool overlayTrackEnded = false;
 volatile uint32_t overlaySampleCount = 0;
+uint32_t overlayMaxSamples = 0;
+uint32_t overlayTrackTotalSeconds = 0;
 int overlayTargetIndex = -1;
 char overlayBasePath[MAX_PATH_LEN];
 char overlayOutputPath[MAX_PATH_LEN];
@@ -186,9 +194,16 @@ bool mixPending = false;
 int mixPendingIndex = -1;
 uint32_t overlayStartMillisIntoTrack = 0;
 
+// Store the original tap timing separately from the delayed single-tap decision.
+// This prevents the double-tap window from hiding when the user actually tapped.
+uint32_t pendingPlaySingleTapPressedAt = 0;
+uint32_t pendingPlaySingleTapReleasedAt = 0;
+uint32_t pendingRecordSingleTapPressedAt = 0;
+uint32_t pendingRecordSingleTapReleasedAt = 0;
+uint32_t pendingRecordSingleTapTrackMillis = 0;
+
 void overlayRecordTask(void* param);
 bool beginOverlayCaptureForCurrentTrack(int index);
-void stopOverlayCapture();
 void servicePendingOverlayMix();
 bool renderOverlayMixToFile(const char* basePath, const char* outputPath, const int16_t* overlay, uint32_t overlayCount);
 
@@ -230,10 +245,28 @@ void scheduleOverlayMixForTrackEnd() {
   }
 }
 
+static void maybeSetAudibleTrackStart(const char* msg) {
+  if (!waitingForAudibleStart || msg == NULL) return;
+
+  // ESP32-audioI2S commonly emits "stream ready" once the stream is ready.
+  // Use that as the best available marker for when playback has actually started
+  // entering the audio pipeline, rather than when connecttoFS() returned.
+  if (strstr(msg, "stream ready") != NULL) {
+    uint32_t now = millis();
+    currentTrackStartMillis = (now > (uint32_t)AUDIO_START_OFFSET_MS) ? now - AUDIO_START_OFFSET_MS : now;
+    waitingForAudibleStart = false;
+    Serial.printf("audible track start set at millis=%lu from callback: %s\n",
+                  (unsigned long)currentTrackStartMillis, msg);
+  }
+}
+
 // event handler
 void my_audio_info(Audio::msg_t m) {
   switch(m.e){
-    case Audio::evt_info:           Serial.printf("info: ....... %s\n", m.msg); break;
+    case Audio::evt_info:
+      Serial.printf("info: ....... %s\n", m.msg);
+      maybeSetAudibleTrackStart(m.msg);
+      break;
     case Audio::evt_eof: {
       Serial.printf("end of file:  %s\n", m.msg); 
 
@@ -245,9 +278,17 @@ void my_audio_info(Audio::msg_t m) {
         break;
       }
 
+      // If a variable-length overlay is still recording when the track ends,
+      // ask the record task to exit. The mix will be scheduled below and
+      // servicePendingOverlayMix() will wait until overlayRecording becomes false.
+      if (overlayRecording) {
+        overlayTrackEnded = true;
+      }
+
       // TODO FEATURE 3: mix only after playback finishes so we never write into a file while Audio.h is reading it.
       scheduleOverlayMixForTrackEnd();
       trackStarted = false;
+      waitingForAudibleStart = false;
       currentTrack++;
       break;
     }
@@ -262,7 +303,10 @@ void my_audio_info(Audio::msg_t m) {
     case Audio::evt_image: for(int i = 0; i < m.vec.size(); i += 2){
                                     Serial.printf("cover image:  segment %02i, pos %07lu, len %05lu\n", i / 2, m.vec[i], m.vec[i + 1]);} break; // APIC
     case Audio::evt_lyrics:         Serial.printf("sync lyrics:  %s\n", m.msg); break;
-    case Audio::evt_log   :         Serial.printf("audio_logs:   %s\n", m.msg); break;
+    case Audio::evt_log   :
+      Serial.printf("audio_logs:   %s\n", m.msg);
+      maybeSetAudibleTrackStart(m.msg);
+      break;
     default:                        Serial.printf("message:..... %s\n", m.msg); break;
   }
 }
@@ -536,15 +580,18 @@ void startTrack(int index) {
 
   Serial.printf("Starting track %d/%d: %s\n", index + 1, queueLen, path);
 
+  waitingForAudibleStart = true;
+  currentTrackStartMillis = 0;
+
   if (!audio.connecttoFS(SD, path)) {
     Serial.printf("connecttoFS failed: %s\n", path);
+    waitingForAudibleStart = false;
     trackStarted = false;
     currentTrack++;
     return;
   }
 
   trackStarted = true;
-  currentTrackStartMillis = millis();
 
   // TODO FEATURE 3:
   // Overlay capture is now button-controlled by RECORD_BUTTON_PIN in loop(),
@@ -559,7 +606,11 @@ void skipToNextTrack() {
   Serial.printf("skip: %s\n", queue[currentTrack].path);
 
   // Treat a manual skip like ending the current track for overlay bookkeeping.
-  // If no overlay was captured, this does nothing.
+  // If an overlay is still recording, ask the task to exit before we schedule
+  // the eventual mix. If no overlay was captured, this does nothing.
+  if (overlayRecording) {
+    overlayTrackEnded = true;
+  }
   scheduleOverlayMixForTrackEnd();
 
   // Stop the current song. Some Audio.h builds may emit evt_eof from stopSong(),
@@ -568,6 +619,7 @@ void skipToNextTrack() {
   audio.stopSong();
 
   trackStarted = false;
+  waitingForAudibleStart = false;
   isPaused = false;
   currentTrack++;
 
@@ -577,20 +629,12 @@ void skipToNextTrack() {
   }
 }
 
-void playLimitBeep() {
-#if LIMIT_BEEP_PIN >= 0
-  // Separate buzzer/piezo feedback so it does not interrupt SD playback.
-  tone(LIMIT_BEEP_PIN, 1200, 80);
-#endif
-  Serial.println("volume limit beep");
-}
 
 void increaseVolume() {
   if (currentVolume >= AUDIO_VOLUME_MAX) {
     currentVolume = AUDIO_VOLUME_MAX;
     audio.setVolume(currentVolume);
     Serial.println("volume already at max");
-    playLimitBeep();
     return;
   }
 
@@ -604,7 +648,6 @@ void decreaseVolume() {
     currentVolume = AUDIO_VOLUME_MIN;
     audio.setVolume(currentVolume);
     Serial.println("volume already at min");
-    playLimitBeep();
     return;
   }
 
@@ -626,25 +669,26 @@ void togglePlayPause() {
 }
 
 void handleRecordSingleTap() {
-  // RECORD now behaves like PLAY/PAUSE:
-  // - first single tap starts the recording window
-  // - next single tap stops the recording window
-  // Double-tap is still reserved for volume up, so this handler is called only
-  // after DOUBLE_TAP_WINDOW_MS has passed without a second tap.
-  if (overlayRecording) {
-    stopOverlayCapture();
-    return;
-  }
-
   if (!trackStarted || playbackDone) {
     Serial.println("record ignored: no active track");
   } else if (isPaused) {
     Serial.println("record ignored: playback is paused");
+  } else if (waitingForAudibleStart || currentTrackStartMillis == 0) {
+    Serial.println("record ignored: audible playback start not known yet");
+  } else if (overlayRecording) {
+    // Second single tap ends the variable recording window. The task exits
+    // after its current/next I2S read, then the overlay is mixed at EOF.
+    overlayStopRequested = true;
+    Serial.println("record stop requested");
   } else if (overlayReady || mixPending) {
     Serial.println("record ignored: overlay already captured for this track");
   } else {
-    overlayStartMillisIntoTrack = millis() - currentTrackStartMillis;
-    Serial.printf("recording window start at %lu ms into track\n", (unsigned long)overlayStartMillisIntoTrack);
+    // Do not set overlayStartMillisIntoTrack here. The single-tap decision is
+    // intentionally delayed to detect a double-tap, so stamping here would be
+    // late. overlayRecordTask stamps the true start immediately before the
+    // first successful mic read attempt.
+    Serial.printf("record requested at %lu ms into track; starting capture task now\n",
+                  (unsigned long)pendingRecordSingleTapTrackMillis);
     beginOverlayCaptureForCurrentTrack(currentTrack);
   }
 }
@@ -1011,7 +1055,34 @@ bool beginOverlayCaptureForCurrentTrack(int index) {
   if (index < 0 || index >= queueLen) return false;
   if (overlayRecording) return false;
 
-  const uint32_t maxSamples = MIC_SAMPLE_RATE * OVERLAY_RECORD_SECONDS;
+  // Size the capture buffer from the current WAV's total duration instead of
+  // a fixed OVERLAY_RECORD_SECONDS window. This is intentionally based on the
+  // WAV header, not manual calculation, so changing tracks does not require
+  // changing code constants.
+  File trackFile = SD.open(queue[index].path, FILE_READ);
+  if (!trackFile) {
+    Serial.printf("Failed to open track for duration: %s\n", queue[index].path);
+    return false;
+  }
+
+  WavInfo trackInfo;
+  if (!readWavInfo(trackFile, trackInfo)) {
+    Serial.printf("Failed to read WAV header for duration: %s\n", queue[index].path);
+    trackFile.close();
+    return false;
+  }
+
+  uint32_t bytesPerFrame = trackInfo.channels * (trackInfo.bitsPerSample / 8);
+  uint32_t trackFrames = bytesPerFrame > 0 ? (trackInfo.dataSize / bytesPerFrame) : 0;
+  uint32_t trackSeconds = trackInfo.sampleRate > 0 ? ((trackFrames + trackInfo.sampleRate - 1) / trackInfo.sampleRate) : 0;
+  trackFile.close();
+
+  if (trackSeconds == 0) {
+    Serial.println("Track duration calculation failed");
+    return false;
+  }
+
+  const uint32_t maxSamples = MIC_SAMPLE_RATE * trackSeconds;
 
   if (overlaySamples) {
     free(overlaySamples);
@@ -1038,8 +1109,11 @@ bool beginOverlayCaptureForCurrentTrack(int index) {
 
   overlayTargetIndex = index;
   overlaySampleCount = 0;
+  overlayMaxSamples = maxSamples;
+  overlayTrackTotalSeconds = trackSeconds;
   overlayReady = false;
   overlayStopRequested = false;
+  overlayTrackEnded = false;
   overlayRecording = true;
 
   BaseType_t ok = xTaskCreatePinnedToCore(overlayRecordTask, "overlayRecordTask", 8192, NULL, 2, NULL, 1);
@@ -1051,37 +1125,47 @@ bool beginOverlayCaptureForCurrentTrack(int index) {
     return false;
   }
 
-  Serial.printf("TODO FEATURE 3: recording overlay for %s -> %s\n", overlayBasePath, overlayOutputPath);
+  Serial.printf("TODO FEATURE 3: recording overlay for %s -> %s (track duration %lu sec, max %lu mic samples)\n",
+                overlayBasePath, overlayOutputPath,
+                (unsigned long)overlayTrackTotalSeconds,
+                (unsigned long)overlayMaxSamples);
   return true;
-}
-
-void stopOverlayCapture() {
-  if (!overlayRecording) {
-    Serial.println("record stop ignored: not currently recording");
-    return;
-  }
-
-  overlayStopRequested = true;
-  Serial.println("recording window stop requested");
 }
 
 void overlayRecordTask(void* param) {
   Serial.println("TODO FEATURE 3: overlayRecordTask started");
 
-  const uint32_t maxSamples = MIC_SAMPLE_RATE * OVERLAY_RECORD_SECONDS;
+  const uint32_t maxSamples = overlayMaxSamples;
   uint32_t skipSamples = (MIC_SAMPLE_RATE * MIC_STARTUP_SKIP_MS) / 1000;
   uint32_t captured = 0;
   uint32_t readBlocks = 0;
+  bool overlayStartStamped = false;
   int32_t rawMin = INT32_MAX;
   int32_t rawMax = INT32_MIN;
   uint32_t rawNonzero = 0;
   float dcPrev = 0.0f;
   float outPrev = 0.0f;
 
-  while (captured < maxSamples && !overlayStopRequested) {
+  while (captured < maxSamples && !overlayStopRequested && !overlayTrackEnded) {
     size_t bytesRead = 0;
+
+    // Capture this timestamp immediately before the read attempt. If the read
+    // succeeds, this is the closest simple marker for when the first mic samples
+    // in this overlay began relative to the audible track timeline.
+    uint32_t readAttemptMillis = millis();
     esp_err_t err = i2s_channel_read(micRxChan, buffer32, BUFFER_SIZE * sizeof(int32_t), &bytesRead, pdMS_TO_TICKS(250));
     if (err != ESP_OK || bytesRead == 0) continue;
+
+    if (!overlayStartStamped) {
+      if (currentTrackStartMillis > 0 && readAttemptMillis >= currentTrackStartMillis) {
+        overlayStartMillisIntoTrack = readAttemptMillis - currentTrackStartMillis;
+      } else {
+        overlayStartMillisIntoTrack = 0;
+      }
+      overlayStartStamped = true;
+      Serial.printf("overlay true mic start at %lu ms into track\n",
+                    (unsigned long)overlayStartMillisIntoTrack);
+    }
 
     readBlocks++;
     int samplesRead = bytesRead / sizeof(int32_t);
@@ -1104,9 +1188,16 @@ void overlayRecordTask(void* param) {
   }
 
   overlaySampleCount = captured;
-  overlayReady = (captured > 0);
+  overlayReady = captured > 0;
   overlayRecording = false;
-  overlayStopRequested = false;
+
+  if (overlayStopRequested) {
+    Serial.println("TODO FEATURE 3: overlay capture stopped by record button");
+  } else if (overlayTrackEnded) {
+    Serial.println("TODO FEATURE 3: overlay capture stopped because track ended");
+  } else if (captured >= maxSamples) {
+    Serial.println("TODO FEATURE 3: overlay capture stopped at max track-duration buffer");
+  }
 
   Serial.printf("TODO FEATURE 3: overlay capture complete (%lu samples from %lu reads)\n",
                 (unsigned long)captured, (unsigned long)readBlocks);
@@ -1383,6 +1474,10 @@ void servicePendingOverlayMix() {
   overlaySamples = NULL;
   overlayReady = false;
   overlaySampleCount = 0;
+  overlayMaxSamples = 0;
+  overlayTrackTotalSeconds = 0;
+  overlayStopRequested = false;
+  overlayTrackEnded = false;
   overlayTargetIndex = -1;
   mixPendingIndex = -1;
   mixPending = false;
@@ -1401,9 +1496,6 @@ void setup() {
 
   pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
   pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP);
-#if LIMIT_BEEP_PIN >= 0
-  pinMode(LIMIT_BEEP_PIN, OUTPUT);
-#endif
 
   Serial.println("Locating manifest:");
   MANIFEST_PATH = findPath("playlist-manifest.json", 5, true);
@@ -1498,6 +1590,8 @@ void loop() {
       } else {
         pendingPlaySingleTap = true;
         pendingPlaySingleTapAt = now;
+        pendingPlaySingleTapPressedAt = playButtonPressedAt;
+        pendingPlaySingleTapReleasedAt = now;
       }
     }
   }
@@ -1506,13 +1600,10 @@ void loop() {
 
 
   // =========================
-  // RECORD START/STOP / VOLUME-UP BUTTON
+  // RECORD / VOLUME-UP BUTTON
   // =========================
 
   bool currentRecordButtonState = digitalRead(RECORD_BUTTON_PIN);
-
-  // Single tap: start recording window if not recording, stop recording window if recording.
-  // Double tap: increase volume.
 
   if (lastRecordButtonState == HIGH && currentRecordButtonState == LOW) {
     recordButtonPressedAt = millis();
@@ -1530,6 +1621,11 @@ void loop() {
       } else {
         pendingRecordSingleTap = true;
         pendingRecordSingleTapAt = now;
+        pendingRecordSingleTapPressedAt = recordButtonPressedAt;
+        pendingRecordSingleTapReleasedAt = now;
+        pendingRecordSingleTapTrackMillis = (currentTrackStartMillis > 0 && now >= currentTrackStartMillis)
+                                           ? now - currentTrackStartMillis
+                                           : 0;
       }
     }
   }
@@ -1560,12 +1656,12 @@ void loop() {
   }
 
   // TODO FEATURE 3:
-  // - record external audio using the record button for exactly OVERLAY_RECORD_SECONDS
+  // - record external audio using RECORD as a variable start/stop window
   // - make sure when we overlay recording over currently playing track, the recording's audio signals still go to both channels because the recording only happens on left channel
   // - track should still be playing while recording audio (if possible)
   // Current button-controlled pass:
   // - startTrack() only starts playback
-  // - RECORD_BUTTON_PIN starts a 5/10-second overlay capture into RAM while playback continues
+  // - RECORD_BUTTON_PIN starts/stops an overlay capture into RAM while playback continues
   // - Audio::evt_eof schedules mixing only if an overlay was captured
   // - servicePendingOverlayMix() renders a new mixed WAV after EOF, then updates the queue path
   servicePendingOverlayMix();
